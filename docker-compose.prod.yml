@@ -42,12 +42,14 @@ services:
 networks:
   mattermost_network:
     name: mattermost_network
-    driver: bridge
+    external: true
 
 volumes:
   mattermost_data:
     name: mattermost_data
+    external: true
   mattermost_logs:
     name: mattermost_logs
+    external: true
   postgres_data:
     name: postgres_data

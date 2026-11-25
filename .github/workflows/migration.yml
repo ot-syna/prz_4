@@ -94,6 +94,12 @@ jobs:
       - name: Deploy Upgraded Stack
         run: |
           Write-Host "Launching Upgraded Mattermost Stack..."
+          $legacyContainers = docker ps -a --filter "label=com.docker.compose.project=legacy" -q
+          if ($legacyContainers) {
+            Write-Host "Stopping and removing legacy stack containers..."
+            docker rm -f $legacyContainers
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           docker compose -f $env:COMPOSE_FILE up -d --remove-orphans
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "Waiting for Mattermost to apply internal database updates..."
