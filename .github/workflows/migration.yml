@@ -82,6 +82,9 @@ jobs:
             "mysql://root:$($env:DB_MYSQL_ROOT_PASSWORD)@mattermost-mysql/mattermost" `
             "postgresql://postgres:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres/mattermost"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Promoting migrated 'mattermost' schema to 'public'..."
+          docker exec mattermost-postgres psql -U postgres -d mattermost -c "DROP SCHEMA IF EXISTS public CASCADE; ALTER SCHEMA mattermost RENAME TO public;"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 5. Установка маркерного флаг-файла успешной миграции
       - name: Mark Migration as Completed
