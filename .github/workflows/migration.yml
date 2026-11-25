@@ -15,7 +15,7 @@ jobs:
     runs-on: self-hosted
     defaults:
       run:
-        shell: bash
+        shell: powershell
 
     steps:
       - name: Checkout code
@@ -25,79 +25,94 @@ jobs:
       - name: Check Migration Status
         id: check_status
         run: |
-          FLAG_FILE="$HOME/.mattermost_migration_completed"
-          if [ -f "$FLAG_FILE" ]; then
-            echo "✅ Database already migrated to PostgreSQL. Skipping data transfer."
-            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "⚠️ Migration required."
-            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
-          fi
+          $flagFile = Join-Path $env:USERPROFILE ".mattermost_migration_completed"
+          if (Test-Path $flagFile) {
+            Write-Host "Database already migrated to PostgreSQL. Skipping data transfer."
+            "already_migrated=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host "Migration required."
+            "already_migrated=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
 
       # 2. Создание резервной копии MySQL перед началом работ
       - name: Backup Legacy MySQL
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          echo "📦 Creating timestamped backup of MySQL..."
-          BACKUP_NAME="mattermost_mysql_backup_${{ github.run_id }}.sql"
-          if docker ps --format '{{.Names}}' | grep -q "^mattermost-mysql$"; then
-            docker exec -e MYSQL_PWD="$DB_MYSQL_ROOT_PASSWORD" mattermost-mysql \
-              mysqldump -u root mattermost > "$BACKUP_NAME"
-            echo "✅ Backup successfully saved as $BACKUP_NAME"
-          else
-            echo "❌ Error: Legacy MySQL container is not running!"
+          Write-Host "Creating timestamped backup of MySQL..."
+          $backupName = "mattermost_mysql_backup_${{ github.run_id }}.sql"
+          $running = docker ps --format "{{.Names}}" | Select-String -Pattern "^mattermost-mysql$"
+          if ($running) {
+            docker exec -e "MYSQL_PWD=$env:DB_MYSQL_ROOT_PASSWORD" mattermost-mysql mysqldump -u root mattermost | Out-File -FilePath $backupName -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "Backup successfully saved as $backupName"
+          } else {
+            Write-Host "Error: Legacy MySQL container is not running!"
             exit 1
-          fi
+          }
 
       # 3. Поднятие контейнера PostgreSQL для приема данных
       - name: Start Target PostgreSQL
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker compose -f "$COMPOSE_FILE" up -d db-postgres
-          echo "⏳ Waiting for PostgreSQL to initialize..."
-          for i in $(seq 1 30); do
-            if docker exec mattermost-postgres pg_isready -U postgres -d mattermost >/dev/null 2>&1; then
-              echo "✅ PostgreSQL is ready."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "❌ PostgreSQL did not become ready in time."
-          exit 1
+          docker compose -f $env:COMPOSE_FILE up -d db-postgres
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Waiting for PostgreSQL to initialize..."
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            docker exec mattermost-postgres pg_isready -U postgres -d mattermost 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "PostgreSQL is ready."
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) {
+            Write-Host "PostgreSQL did not become ready in time."
+            exit 1
+          }
 
       # 4. Гетерогенная миграция данных с помощью pgloader
       - name: Run pgloader (With Schema Drop for Idempotency)
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          echo "🔄 Migrating schema and data from MySQL to PostgreSQL..."
-          docker run --rm --network=mattermost_network \
-            mattermost/mattermost-pgloader:latest pgloader \
-            --with "include drop" \
-            "mysql://root:${DB_MYSQL_ROOT_PASSWORD}@mattermost-mysql/mattermost" \
-            "postgresql://postgres:${DB_POSTGRES_PASSWORD}@mattermost-postgres/mattermost"
+          Write-Host "Migrating schema and data from MySQL to PostgreSQL..."
+          docker run --rm --network=mattermost_network mattermost/mattermost-pgloader:latest pgloader `
+            --with "include drop" `
+            "mysql://root:$($env:DB_MYSQL_ROOT_PASSWORD)@mattermost-mysql/mattermost" `
+            "postgresql://postgres:$($env:DB_POSTGRES_PASSWORD)@mattermost-postgres/mattermost"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 5. Установка маркерного флаг-файла успешной миграции
       - name: Mark Migration as Completed
         if: steps.check_status.outputs.already_migrated == 'false'
-        run: touch "$HOME/.mattermost_migration_completed"
+        run: |
+          $flagFile = Join-Path $env:USERPROFILE ".mattermost_migration_completed"
+          New-Item -ItemType File -Path $flagFile -Force | Out-Null
 
       # 6. Развертывание обновленного продакшн-стека
       - name: Deploy Upgraded Stack
         run: |
-          echo "🚀 Launching Upgraded Mattermost Stack..."
-          docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
-          echo "⏳ Waiting for Mattermost to apply internal database updates..."
-          sleep 30
+          Write-Host "Launching Upgraded Mattermost Stack..."
+          docker compose -f $env:COMPOSE_FILE up -d --remove-orphans
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Waiting for Mattermost to apply internal database updates..."
+          Start-Sleep -Seconds 30
 
       # 7. Автоматическое тестирование работоспособности
       - name: Run Health Checks & Verify Data
         run: |
-          echo "🧪 Running Smoke Tests..."
-          if curl -fsS http://localhost:8065/api/v4/system/ping; then
-            echo ""
-            echo "✅ Mattermost upgraded successfully and running on Postgres!"
-          else
-            echo "❌ Application health check failed. Fetching logs..."
-            docker compose -f "$COMPOSE_FILE" logs --tail=100
+          Write-Host "Running Smoke Tests..."
+          try {
+            $resp = Invoke-WebRequest -Uri "http://localhost:8065/api/v4/system/ping" -UseBasicParsing -TimeoutSec 10
+            if ($resp.StatusCode -eq 200) {
+              Write-Host "Mattermost upgraded successfully and running on Postgres! Status: $($resp.StatusCode)"
+              Write-Host $resp.Content
+            } else {
+              throw "Unexpected status code: $($resp.StatusCode)"
+            }
+          } catch {
+            Write-Host "Application health check failed. Fetching logs..."
+            docker compose -f $env:COMPOSE_FILE logs --tail=100
             exit 1
-          fi
+          }
